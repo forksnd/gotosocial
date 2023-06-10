@@ -25,7 +25,6 @@ import (
 	"fmt"
 	"io"
 	"mime/multipart"
-	"strings"
 	"time"
 
 	"codeberg.org/gruf/go-kv"
@@ -38,94 +37,96 @@ import (
 	"github.com/superseriousbusiness/gotosocial/internal/log"
 	"github.com/superseriousbusiness/gotosocial/internal/messages"
 	"github.com/superseriousbusiness/gotosocial/internal/text"
+	"github.com/superseriousbusiness/gotosocial/internal/util"
 )
 
-func (p *Processor) DomainBlockCreate(ctx context.Context, account *gtsmodel.Account, domain string, obfuscate bool, publicComment string, privateComment string, subscriptionID string) (*apimodel.DomainBlock, gtserror.WithCode) {
-	// domain blocks will always be lowercase
-	domain = strings.ToLower(domain)
-
-	// first check if we already have a block -- if err == nil we already had a block so we can skip a whole lot of work
-	block, err := p.state.DB.GetDomainBlock(ctx, domain)
+func (p *Processor) DomainBlockCreate(
+	ctx context.Context,
+	account *gtsmodel.Account,
+	domain string,
+	obfuscate bool,
+	publicComment string,
+	privateComment string,
+	subscriptionID string,
+) (*apimodel.DomainBlock, gtserror.WithCode) {
+	// Normalize the domain as punycode
+	var err error
+	domain, err = util.Punify(domain)
 	if err != nil {
-		if !errors.Is(err, db.ErrNoEntries) {
-			// something went wrong in the DB
-			return nil, gtserror.NewErrorInternalError(fmt.Errorf("db error checking for existence of domain block %s: %s", domain, err))
-		}
-
-		// there's no block for this domain yet so create one
-		newBlock := &gtsmodel.DomainBlock{
-			ID:                 id.NewULID(),
-			Domain:             domain,
-			CreatedByAccountID: account.ID,
-			PrivateComment:     text.SanitizePlaintext(privateComment),
-			PublicComment:      text.SanitizePlaintext(publicComment),
-			Obfuscate:          &obfuscate,
-			SubscriptionID:     subscriptionID,
-		}
-
-		// Insert the new block into the database
-		if err := p.state.DB.CreateDomainBlock(ctx, newBlock); err != nil {
-			return nil, gtserror.NewErrorInternalError(fmt.Errorf("db error putting new domain block %s: %s", domain, err))
-		}
-
-		// Set the newly created block
-		block = newBlock
-
-		// Process the side effects of the domain block asynchronously since it might take a while
-		go func() {
-			p.initiateDomainBlockSideEffects(context.Background(), account, block)
-		}()
+		err := gtserror.Newf("error punifying domain %s: %w", domain, err)
+		return nil, gtserror.NewErrorInternalError(err)
 	}
 
-	// Convert our gts model domain block into an API model
-	apiDomainBlock, err := p.tc.DomainBlockToAPIDomainBlock(ctx, block, false)
-	if err != nil {
-		return nil, gtserror.NewErrorInternalError(fmt.Errorf("error converting domain block to frontend/api representation %s: %s", domain, err))
+	// Check if a block already exists for this domain.
+	domainBlock, err := p.state.DB.GetDomainBlock(ctx, domain)
+	if err != nil && !errors.Is(err, db.ErrNoEntries) {
+		// Something went wrong in the DB.
+		err = gtserror.Newf("db error getting domain block %s: %w", domain, err)
+		return nil, gtserror.NewErrorInternalError(err)
 	}
 
-	return apiDomainBlock, nil
+	if domainBlock != nil {
+		// Nothing to do.
+		return p.apiDomainBlock(ctx, domainBlock)
+	}
+
+	// No block exists yet, create it.
+	domainBlock = &gtsmodel.DomainBlock{
+		ID:                 id.NewULID(),
+		Domain:             domain,
+		CreatedByAccountID: account.ID,
+		PrivateComment:     text.SanitizePlaintext(privateComment),
+		PublicComment:      text.SanitizePlaintext(publicComment),
+		Obfuscate:          &obfuscate,
+		SubscriptionID:     subscriptionID,
+	}
+
+	// Insert the new block into the database.
+	if err := p.state.DB.CreateDomainBlock(ctx, domainBlock); err != nil {
+		err = gtserror.Newf("db error putting domain block %s: %s", domain, err)
+		return nil, gtserror.NewErrorInternalError(err)
+	}
+
+	// Process the side effects of the domain block
+	// asynchronously since it might take a while.
+	go p.domainBlockSideEffects(
+		// Use new context, not request context.
+		context.Background(),
+		account,
+		domainBlock,
+	)
+
+	return p.apiDomainBlock(ctx, domainBlock)
 }
 
-// initiateDomainBlockSideEffects should be called asynchronously, to process the side effects of a domain block:
+// domainBlockSideEffects should be called asynchronously, to process the side effects of a domain block:
 //
 // 1. Strip most info away from the instance entry for the domain.
 // 2. Delete the instance account for that instance if it exists.
 // 3. Select all accounts from this instance and pass them through the delete functionality of the processor.
-func (p *Processor) initiateDomainBlockSideEffects(ctx context.Context, account *gtsmodel.Account, block *gtsmodel.DomainBlock) {
-	l := log.WithContext(ctx).WithFields(kv.Fields{{"domain", block.Domain}}...)
+func (p *Processor) domainBlockSideEffects(ctx context.Context, account *gtsmodel.Account, block *gtsmodel.DomainBlock) {
+	l := log.
+		WithContext(ctx).
+		WithFields(kv.Fields{
+			{"domain", block.Domain},
+		}...)
 	l.Debug("processing domain block side effects")
 
-	// if we have an instance entry for this domain, update it with the new block ID and clear all fields
-	instance := &gtsmodel.Instance{}
-	if err := p.state.DB.GetWhere(ctx, []db.Where{{Key: "domain", Value: block.Domain}}, instance); err == nil {
-		updatingColumns := []string{
-			"title",
-			"updated_at",
-			"suspended_at",
-			"domain_block_id",
-			"short_description",
-			"description",
-			"terms",
-			"contact_email",
-			"contact_account_username",
-			"contact_account_id",
-			"version",
+	// If we have an instance entry for this domain,
+	// update it with the new block ID and clear all fields
+	instance, err := p.state.DB.GetInstance(ctx, block.Domain)
+	if err != nil && !errors.Is(err, db.ErrNoEntries) {
+		l.Errorf("db error getting instance %s: %q", block.Domain, err)
+	}
+
+	if instance != nil {
+		// We had an entry for this domain.
+		columns := stubbifyInstance(instance, block.ID)
+		if err := p.state.DB.UpdateInstance(ctx, instance, columns...); err != nil {
+			l.Errorf("db error updating instance: %s", err)
+		} else {
+			l.Debug("instance entry updated")
 		}
-		instance.Title = ""
-		instance.UpdatedAt = time.Now()
-		instance.SuspendedAt = time.Now()
-		instance.DomainBlockID = block.ID
-		instance.ShortDescription = ""
-		instance.Description = ""
-		instance.Terms = ""
-		instance.ContactEmail = ""
-		instance.ContactAccountUsername = ""
-		instance.ContactAccountID = ""
-		instance.Version = ""
-		if err := p.state.DB.UpdateByID(ctx, instance, instance.ID, updatingColumns...); err != nil {
-			l.Errorf("domainBlockProcessSideEffects: db error updating instance: %s", err)
-		}
-		l.Debug("domainBlockProcessSideEffects: instance entry updated")
 	}
 
 	// if we have an instance account for this instance, delete it
@@ -255,56 +256,111 @@ func (p *Processor) DomainBlockGet(ctx context.Context, account *gtsmodel.Accoun
 
 // DomainBlockDelete removes one domain block with the given ID.
 func (p *Processor) DomainBlockDelete(ctx context.Context, account *gtsmodel.Account, id string) (*apimodel.DomainBlock, gtserror.WithCode) {
-	domainBlock := &gtsmodel.DomainBlock{}
-
-	if err := p.state.DB.GetByID(ctx, id, domainBlock); err != nil {
+	domainBlock, err := p.state.DB.GetDomainBlockByID(ctx, id)
+	if err != nil {
 		if !errors.Is(err, db.ErrNoEntries) {
-			// something has gone really wrong
+			// Real error.
+			err = gtserror.Newf("db error getting domain block: %w", err)
 			return nil, gtserror.NewErrorInternalError(err)
 		}
-		// there are no entries for this ID
-		return nil, gtserror.NewErrorNotFound(fmt.Errorf("no entry for ID %s", id))
+
+		// There are just no entries for this ID.
+		err = fmt.Errorf("no domain block entry exists with ID %s", id)
+		return nil, gtserror.NewErrorNotFound(err, err.Error())
 	}
 
-	// prepare the domain block to return
+	// Prepare the domain block to return, *before* the deletion goes through.
 	apiDomainBlock, err := p.tc.DomainBlockToAPIDomainBlock(ctx, domainBlock, false)
 	if err != nil {
+		err = gtserror.Newf("error converting domain block to api domain block: %w", err)
 		return nil, gtserror.NewErrorInternalError(err)
 	}
 
-	// Delete the domain block
+	// Delete the domain block.
 	if err := p.state.DB.DeleteDomainBlock(ctx, domainBlock.Domain); err != nil {
+		err = gtserror.Newf("db error deleting domain block: %w", err)
 		return nil, gtserror.NewErrorInternalError(err)
 	}
 
-	// remove the domain block reference from the instance, if we have an entry for it
-	i := &gtsmodel.Instance{}
-	if err := p.state.DB.GetWhere(ctx, []db.Where{
-		{Key: "domain", Value: domainBlock.Domain},
-		{Key: "domain_block_id", Value: id},
-	}, i); err == nil {
-		updatingColumns := []string{"suspended_at", "domain_block_id", "updated_at"}
-		i.SuspendedAt = time.Time{}
-		i.DomainBlockID = ""
-		i.UpdatedAt = time.Now()
-		if err := p.state.DB.UpdateByID(ctx, i, i.ID, updatingColumns...); err != nil {
-			return nil, gtserror.NewErrorInternalError(fmt.Errorf("couldn't update database entry for instance %s: %s", domainBlock.Domain, err))
+	// Update instance entry for this domain, if we have it.
+	instance, err := p.state.DB.GetInstance(ctx, domainBlock.Domain)
+	if err != nil && !errors.Is(err, db.ErrNoEntries) {
+		err = gtserror.Newf("db error getting instance with domain %s: %w", domainBlock.Domain, err)
+		return nil, gtserror.NewErrorInternalError(err)
+	}
+
+	if instance != nil {
+		// We had an entry, update it to signal
+		// that it's no longer suspended.
+		instance.SuspendedAt = time.Time{}
+		instance.DomainBlockID = ""
+		if err := p.state.DB.UpdateInstance(
+			ctx,
+			instance,
+			"suspended_at",
+			"domain_block_id",
+		); err != nil {
+			err = gtserror.Newf("db error updating instance with domain %s: %w", domainBlock.Domain, err)
+			return nil, gtserror.NewErrorInternalError(err)
 		}
 	}
 
-	// unsuspend all accounts whose suspension origin was this domain block
+	// Unsuspend all accounts whose suspension origin was this domain block
 	// 1. remove the 'suspended_at' entry from their accounts
 	if err := p.state.DB.UpdateWhere(ctx, []db.Where{
 		{Key: "suspension_origin", Value: domainBlock.ID},
 	}, "suspended_at", nil, &[]*gtsmodel.Account{}); err != nil {
-		return nil, gtserror.NewErrorInternalError(fmt.Errorf("database error removing suspended_at from accounts: %s", err))
-	}
+		err = fmt.Errorf("database error removing suspended_at from accounts: %w", err)
+		return nil, gtserror.NewErrorInternalError(err)
+	}aaaaaaaaaaaaaaaaaaa
 
 	// 2. remove the 'suspension_origin' entry from their accounts
 	if err := p.state.DB.UpdateWhere(ctx, []db.Where{
 		{Key: "suspension_origin", Value: domainBlock.ID},
 	}, "suspension_origin", nil, &[]*gtsmodel.Account{}); err != nil {
 		return nil, gtserror.NewErrorInternalError(fmt.Errorf("database error removing suspension_origin from accounts: %s", err))
+	}
+
+	return apiDomainBlock, nil
+}
+
+// stubbifyInstance renders the given instance as a stub,
+// removing most information from it and marking it as
+// suspended.
+//
+// For caller's convenience, this function returns the db
+// names of all columns that are updated by it.
+func stubbifyInstance(instance *gtsmodel.Instance, domainBlockID string) []string {
+	instance.Title = ""
+	instance.SuspendedAt = time.Now()
+	instance.DomainBlockID = domainBlockID
+	instance.ShortDescription = ""
+	instance.Description = ""
+	instance.Terms = ""
+	instance.ContactEmail = ""
+	instance.ContactAccountUsername = ""
+	instance.ContactAccountID = ""
+	instance.Version = ""
+
+	return []string{
+		"title",
+		"suspended_at",
+		"domain_block_id",
+		"short_description",
+		"description",
+		"terms",
+		"contact_email",
+		"contact_account_username",
+		"contact_account_id",
+		"version",
+	}
+}
+
+func (p *Processor) apiDomainBlock(ctx context.Context, domainBlock *gtsmodel.DomainBlock) (*apimodel.DomainBlock, gtserror.WithCode) {
+	apiDomainBlock, err := p.tc.DomainBlockToAPIDomainBlock(ctx, domainBlock, false)
+	if err != nil {
+		err = gtserror.Newf("error converting domain block for %s to api model : %w", domainBlock.Domain, err)
+		gtserror.NewErrorInternalError(err)
 	}
 
 	return apiDomainBlock, nil

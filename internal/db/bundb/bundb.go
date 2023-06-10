@@ -178,7 +178,8 @@ func NewBunDBService(ctx context.Context, state *state.State) (db.DB, error) {
 			state: state,
 		},
 		Instance: &instanceDB{
-			conn: conn,
+			conn:  conn,
+			state: state,
 		},
 		List: &listDB{
 			conn:  conn,
