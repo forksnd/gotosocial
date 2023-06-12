@@ -35,6 +35,9 @@ type Domain interface {
 	// GetDomainBlockByID returns one instance-level domain block with the given id, if it exists.
 	GetDomainBlockByID(ctx context.Context, id string) (*gtsmodel.DomainBlock, Error)
 
+	// GetDomainBlocks returns all instance-level domain blocks currently enforced by this instance.
+	GetDomainBlocks(ctx context.Context) ([]*gtsmodel.DomainBlock, error)
+
 	// DeleteDomainBlock deletes an instance-level domain block with the given domain, if it exists.
 	DeleteDomainBlock(ctx context.Context, domain string) Error
 

@@ -26,6 +26,7 @@ import (
 	"github.com/superseriousbusiness/gotosocial/internal/gtscontext"
 	"github.com/superseriousbusiness/gotosocial/internal/gtserror"
 	"github.com/superseriousbusiness/gotosocial/internal/gtsmodel"
+	"github.com/superseriousbusiness/gotosocial/internal/id"
 	"github.com/superseriousbusiness/gotosocial/internal/log"
 	"github.com/superseriousbusiness/gotosocial/internal/state"
 	"github.com/superseriousbusiness/gotosocial/internal/util"
@@ -277,34 +278,60 @@ func (i *instanceDB) GetInstancePeers(ctx context.Context, includeSuspended bool
 }
 
 func (i *instanceDB) GetInstanceAccounts(ctx context.Context, domain string, maxID string, limit int) ([]*gtsmodel.Account, db.Error) {
-	// Normalize the domain as punycode
+	// Ensure reasonable
+	if limit < 0 {
+		limit = 0
+	}
+
+	// Normalize the domain as punycode.
 	var err error
 	domain, err = util.Punify(domain)
 	if err != nil {
 		return nil, gtserror.Newf("error punifying domain %s: %w", domain, err)
 	}
 
-	accounts := []*gtsmodel.Account{}
+	// Make educated guess for slice size
+	accountIDs := make([]string, 0, limit)
 
-	q := i.conn.NewSelect().
-		Model(&accounts).
+	q := i.conn.
+		NewSelect().
+		TableExpr("? AS ?", bun.Ident("accounts"), bun.Ident("account")).
+		// Select just the account ID.
+		Column("account.id").
+		// Select accounts belonging to given domain.
 		Where("? = ?", bun.Ident("account.domain"), domain).
 		Order("account.id DESC")
 
-	if maxID != "" {
-		q = q.Where("? < ?", bun.Ident("account.id"), maxID)
+	if maxID == "" {
+		maxID = id.Highest
 	}
+	q = q.Where("? < ?", bun.Ident("account.id"), maxID)
 
 	if limit > 0 {
 		q = q.Limit(limit)
 	}
 
-	if err := q.Scan(ctx); err != nil {
+	if err := q.Scan(ctx, &accountIDs); err != nil {
 		return nil, i.conn.ProcessError(err)
 	}
 
-	if len(accounts) == 0 {
+	// Catch case of no accounts early.
+	count := len(accountIDs)
+	if count == 0 {
 		return nil, db.ErrNoEntries
+	}
+
+	// Select each account by its ID.
+	accounts := make([]*gtsmodel.Account, 0, count)
+	for _, id := range accountIDs {
+		account, err := i.state.DB.GetAccountByID(ctx, id)
+		if err != nil {
+			log.Errorf(ctx, "error getting account %q: %v", id, err)
+			continue
+		}
+
+		// Append to return slice.
+		accounts = append(accounts, account)
 	}
 
 	return accounts, nil

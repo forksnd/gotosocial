@@ -82,6 +82,19 @@ func (d *domainDB) GetDomainBlock(ctx context.Context, domain string) (*gtsmodel
 	return &block, nil
 }
 
+func (d *domainDB) GetDomainBlocks(ctx context.Context) ([]*gtsmodel.DomainBlock, error) {
+	blocks := []*gtsmodel.DomainBlock{}
+
+	if err := d.conn.
+		NewSelect().
+		Model(&blocks).
+		Scan(ctx); err != nil {
+		return nil, d.conn.ProcessError(err)
+	}
+
+	return blocks, nil
+}
+
 func (d *domainDB) GetDomainBlockByID(ctx context.Context, id string) (*gtsmodel.DomainBlock, db.Error) {
 	var block gtsmodel.DomainBlock
 
