@@ -122,6 +122,7 @@ func (i *instanceDB) GetInstance(ctx context.Context, domain string) (*gtsmodel.
 				Where("? = ?", bun.Ident("instance.domain"), domain).
 				Scan(ctx)
 		},
+		domain,
 	)
 }
 
@@ -135,6 +136,7 @@ func (i *instanceDB) GetInstanceByID(ctx context.Context, id string) (*gtsmodel.
 				Where("? = ?", bun.Ident("instance.id"), id).
 				Scan(ctx)
 		},
+		id,
 	)
 }
 
